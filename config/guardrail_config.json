@@ -1,0 +1,24 @@
+{
+  "model_name": "microsoft/deberta-v3-base",
+  "checkpoint": "/content/drive/MyDrive/guardrail_model/checkpoint-10623",
+  "lora_adapter_path": "/content/drive/MyDrive/guardrail_model/lora_adapter_final",
+  "onnx_model_path": "/content/drive/MyDrive/onnx_export/guardrail_classifier.onnx",
+  "onnx_model_size_mb": 369.8,
+  "max_length": 512,
+  "label_names": [
+    "prompt_injection",
+    "pii_present",
+    "jailbreak",
+    "policy_violation"
+  ],
+  "label_thresholds": {
+    "prompt_injection": 0.5,
+    "jailbreak": 0.3,
+    "policy_violation": 0.3,
+    "pii_present": 0.4
+  },
+  "inference_backend": "onnxruntime-gpu / FP32",
+  "latency_mean_ms": 11.7,
+  "latency_p95_ms": 18.0,
+  "notes": "checkpoint-10623 is the final checkpoint"
+}
