@@ -1,9 +1,8 @@
 """
-GuardRail-OS gateway - Step 1: pure pass-through proxy.
+GuardRail-OS gateway - Step 2: input guardrail wired in.
 
-Exposes an OpenAI-compatible POST /v1/chat/completions endpoint and forwards
-requests to Gemini (Google AI Studio SDK). No guardrails yet - this step only
-proves the plumbing: OpenAI-format request in, OpenAI-format response out.
+Flow: request -> classify prompt -> BLOCK (403 + trace headers) or
+PASS (forward to Gemini, attach safety-score header).
 """
 
 import os
@@ -11,26 +10,29 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import google.generativeai as genai
 
+from app.guardrails.input_layer import InputClassifier
+
 # ---- Config ----
-load_dotenv()  # reads .env from the project root
+load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     raise RuntimeError("No API key found. Put GEMINI_API_KEY=... in your .env file.")
 genai.configure(api_key=API_KEY)
-
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.5-flash")
 
-app = FastAPI(title="GuardRail-OS", version="0.1.0")
+app = FastAPI(title="GuardRail-OS", version="0.2.0")
+
+# Load the classifier once at startup (heavy: model load happens here, not per request)
+classifier = InputClassifier()
 
 
-# ---- OpenAI-format request schema ----
 class ChatMessage(BaseModel):
-    role: str          # "system" | "user" | "assistant"
+    role: str
     content: str
 
 
@@ -41,9 +43,7 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 
-# ---- OpenAI <-> Gemini translation ----
 def to_gemini(messages: List[ChatMessage]):
-    """OpenAI messages -> (system_instruction, gemini contents)."""
     system_instruction = None
     contents = []
     for m in messages:
@@ -54,21 +54,48 @@ def to_gemini(messages: List[ChatMessage]):
             )
         elif m.role == "assistant":
             contents.append({"role": "model", "parts": [m.content]})
-        else:  # "user" or anything unknown -> treat as user
+        else:
             contents.append({"role": "user", "parts": [m.content]})
     return system_instruction, contents
 
 
+def latest_user_text(messages: List[ChatMessage]) -> str:
+    for m in reversed(messages):
+        if m.role == "user":
+            return m.content
+    return ""
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "default_model": DEFAULT_MODEL}
+    return {"status": "ok", "default_model": DEFAULT_MODEL, "provider": classifier.provider}
 
 
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatRequest):
+def chat_completions(req: ChatRequest, response: Response):
+    # ---- Input guardrail ----
+    user_text = latest_user_text(req.messages)
+    verdict = classifier.classify(user_text)
+    input_score = max(verdict["scores"].values()) if verdict["scores"] else 0.0
+
+    if verdict["decision"] == "BLOCK":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "blocked_by_guardrail",
+                "reason_categories": verdict["fired_labels"],
+                "scores": verdict["scores"],
+            },
+            headers={
+                "X-GuardRail-Decision": "BLOCK",
+                "X-GuardRail-Reason": ",".join(verdict["fired_labels"]),
+                "X-GuardRail-Input-Score": f"{input_score:.4f}",
+            },
+        )
+
+    # ---- PASS: forward to Gemini ----
     model_name = req.model or DEFAULT_MODEL
     system_instruction, contents = to_gemini(req.messages)
-
     gen_config = {}
     if req.temperature is not None:
         gen_config["temperature"] = req.temperature
@@ -82,10 +109,13 @@ def chat_completions(req: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
 
-    # Map Gemini usage -> OpenAI usage shape
     um = getattr(resp, "usage_metadata", None)
     prompt_tokens = getattr(um, "prompt_token_count", 0) if um else 0
     completion_tokens = getattr(um, "candidates_token_count", 0) if um else 0
+
+    response.headers["X-GuardRail-Decision"] = "PASS"
+    response.headers["X-GuardRail-Input-Score"] = f"{input_score:.4f}"
+    response.headers["X-GuardRail-Model-Used"] = model_name
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
