@@ -1,0 +1,8 @@
+id: no-jailbreak
+domain: prompt-security
+regulation: EU-AI-Act
+action: block
+priority: 90
+description: Block jailbreak / persona-override attempts (e.g. DAN).
+triggers:
+  classifier_labels: [jailbreak]

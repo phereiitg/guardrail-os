@@ -1,0 +1,8 @@
+id: block-harmful-content
+domain: content-safety
+regulation: EU-AI-Act
+action: block
+priority: 70
+description: Block content the classifier flags as a policy violation.
+triggers:
+  classifier_labels: [policy_violation]

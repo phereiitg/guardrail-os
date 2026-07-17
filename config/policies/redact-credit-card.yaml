@@ -1,0 +1,9 @@
+id: redact-credit-card
+domain: pii-protection
+regulation: PCI-DSS
+action: sanitize
+priority: 80
+description: Redact credit-card data before forwarding to the LLM.
+triggers:
+  classifier_labels: [pii_present]
+  keywords: [credit card, card number, cvv, expiry]

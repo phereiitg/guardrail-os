@@ -1,0 +1,8 @@
+id: redact-general-pii
+domain: pii-protection
+regulation: GDPR
+action: sanitize
+priority: 60
+description: Redact general personal data (IDs, emails, numbers) before forwarding.
+triggers:
+  classifier_labels: [pii_present]

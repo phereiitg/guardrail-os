@@ -1,0 +1,9 @@
+id: strict-financial-block
+domain: pii-protection
+regulation: PCI-DSS
+action: block
+priority: 85
+description: In strict mode, fully block requests containing card data rather than sanitizing.
+triggers:
+  classifier_labels: [pii_present]
+  keywords: [credit card, card number, cvv]
