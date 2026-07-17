@@ -1,0 +1,14 @@
+id: data-erasure-consent
+domain: pii-protection
+regulation: GDPR
+action: block
+priority: 75
+description: >
+  User requests to erase, delete, or forget their personal data or account.
+  These invoke the GDPR right to erasure and must be routed to the compliance
+  workflow rather than answered by the LLM.
+triggers:
+  keywords: [forget my data, delete my account, erase my data, right to be forgotten, remove my information]
+# NOTE: intentionally has NO classifier_labels. This policy is reachable ONLY via
+# the ChromaDB semantic path, demonstrating why dual-path retrieval is needed:
+# the classifier has no label for "right to erasure", but semantic search finds it.
