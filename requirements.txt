@@ -1,0 +1,36 @@
+# ---- GuardRail-OS dependencies ----
+# For exact pinned versions matching YOUR machine, run:  pip freeze > requirements.txt
+# This file lists everything the project imports, grouped by role.
+
+# --- API gateway ---
+fastapi
+uvicorn
+python-dotenv
+pydantic
+
+# --- LLM provider (Google AI Studio SDK) ---
+google-generativeai
+
+# --- Input classifier (DeBERTa-v3 ONNX) ---
+onnxruntime            # CPU inference; swap for onnxruntime-gpu to hit ~12ms on GPU
+transformers           # tokenizer only (no torch needed for the classifier path)
+numpy
+
+# --- GraphRAG policy engine ---
+chromadb               # vector store + ONNX MiniLM embedder (semantic path)
+networkx               # policy hierarchy graph (leaf -> domain -> regulation)
+pyyaml                 # policy files
+
+# --- Orchestration ---
+langgraph
+
+# --- Output guardrails ---
+# torch is required by Detoxify. The line below pulls the CUDA (GPU) build.
+# If your GPU/driver doesn't match, remove the --extra-index-url line to get the CPU build.
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch
+detoxify
+
+# --- Testing ---
+pytest
+requests               # used by the test_*.py client scripts
