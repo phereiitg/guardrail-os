@@ -14,7 +14,7 @@
   "label_thresholds": {
     "prompt_injection": 0.5,
     "jailbreak": 0.3,
-    "policy_violation": 0.3,
+    "policy_violation": 0.6,
     "pii_present": 0.4
   },
   "inference_backend": "onnxruntime-gpu / FP32",

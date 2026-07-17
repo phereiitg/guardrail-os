@@ -1,9 +1,10 @@
 """
-GuardRail-OS gateway - Step 4: input + policy + OUTPUT guardrails.
+GuardRail-OS gateway - Step 5: LangGraph-orchestrated pipeline.
 
-Flow: request -> classify -> policy resolve -> BLOCK/SANITIZE/PASS
-      -> call Gemini -> OUTPUT check (toxicity/schema/consistency)
-      -> retry up to 2x on failure -> safe fallback if still failing -> deliver
+main.py is now thin: it builds the guardrail components + the LangGraph pipeline
+once, then each request invokes the graph and this endpoint translates the final
+graph state into an HTTP response. All branching (block/sanitize/pass, retry
+cycle) lives in app/graph.py.
 """
 
 import os
@@ -20,6 +21,7 @@ import google.generativeai as genai
 from app.guardrails.input_layer import InputClassifier
 from app.guardrails.policy_rag import PolicyEngine
 from app.guardrails.output_layer import OutputGuardrail
+from app.graph import build_pipeline
 
 # ---- Config ----
 load_dotenv()
@@ -30,8 +32,9 @@ genai.configure(api_key=API_KEY)
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.5-flash")
 MAX_RETRIES = 2
 
-app = FastAPI(title="GuardRail-OS", version="0.4.0")
+app = FastAPI(title="GuardRail-OS", version="0.5.0")
 
+# ---- components (loaded once) ----
 classifier = InputClassifier()
 policy_engine = PolicyEngine()
 output_guard = OutputGuardrail()
@@ -47,7 +50,31 @@ class ChatRequest(BaseModel):
     model: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
-    required_json_fields: Optional[List[str]] = None  # triggers schema validation
+    required_json_fields: Optional[List[str]] = None
+
+
+# ---- LLM translation + call (operates on plain dict messages) ----
+def to_gemini(messages, extra_system=None):
+    system_instruction = None
+    contents = []
+    for m in messages:
+        role, content = m["role"], m["content"]
+        if role == "system":
+            system_instruction = content if system_instruction is None else system_instruction + "\n" + content
+        elif role == "assistant":
+            contents.append({"role": "model", "parts": [content]})
+        else:
+            contents.append({"role": "user", "parts": [content]})
+    if extra_system:
+        system_instruction = (system_instruction + "\n" + extra_system) if system_instruction else extra_system
+    return system_instruction, contents
+
+
+def call_gemini(model_name, messages, gen_config, extra_system=None):
+    system_instruction, contents = to_gemini(messages, extra_system)
+    model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
+    resp = model.generate_content(contents, generation_config=gen_config or None)
+    return resp.text, resp
 
 
 _REDACT_PATTERNS = [
@@ -63,19 +90,8 @@ def sanitize_text(text: str) -> str:
     return text
 
 
-def to_gemini(messages: List[ChatMessage], extra_system: Optional[str] = None):
-    system_instruction = None
-    contents = []
-    for m in messages:
-        if m.role == "system":
-            system_instruction = m.content if system_instruction is None else system_instruction + "\n" + m.content
-        elif m.role == "assistant":
-            contents.append({"role": "model", "parts": [m.content]})
-        else:
-            contents.append({"role": "user", "parts": [m.content]})
-    if extra_system:
-        system_instruction = (system_instruction + "\n" + extra_system) if system_instruction else extra_system
-    return system_instruction, contents
+# ---- build the LangGraph pipeline once ----
+pipeline = build_pipeline(classifier, policy_engine, output_guard, call_gemini, sanitize_text, MAX_RETRIES)
 
 
 def latest_user_text(messages: List[ChatMessage]) -> str:
@@ -83,13 +99,6 @@ def latest_user_text(messages: List[ChatMessage]) -> str:
         if m.role == "user":
             return m.content
     return ""
-
-
-def call_gemini(model_name, messages, gen_config, extra_system=None) -> str:
-    system_instruction, contents = to_gemini(messages, extra_system)
-    model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
-    resp = model.generate_content(contents, generation_config=gen_config or None)
-    return resp.text, resp
 
 
 @app.get("/health")
@@ -109,21 +118,34 @@ def policy_graph():
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest, response: Response):
-    user_text = latest_user_text(req.messages)
+    gen_config = {}
+    if req.temperature is not None:
+        gen_config["temperature"] = req.temperature
+    if req.max_tokens is not None:
+        gen_config["max_output_tokens"] = req.max_tokens
 
-    # ---- INPUT: classify + resolve ----
-    verdict = classifier.classify(user_text)
-    fired = verdict["fired_labels"]
-    input_score = max(verdict["scores"].values()) if verdict["scores"] else 0.0
-    decision = policy_engine.resolve(fired, user_text)
+    initial = {
+        "messages": [m.model_dump() for m in req.messages],
+        "user_text": latest_user_text(req.messages),
+        "required_json_fields": req.required_json_fields,
+        "model_name": req.model or DEFAULT_MODEL,
+        "gen_config": gen_config,
+        "attempt": 0,
+    }
+
+    final = pipeline.invoke(initial)
+
+    decision = final["decision"]
     chain_str = " > ".join(decision["policy_chain"])
+    input_score = final["input_score"]
 
-    if decision["decision"] == "BLOCK":
+    # ---- BLOCK ----
+    if final.get("blocked"):
         raise HTTPException(
             status_code=403,
             detail={
                 "error": "blocked_by_guardrail",
-                "fired_labels": fired,
+                "fired_labels": final["fired_labels"],
                 "winning_policy": decision["winning_policy"],
                 "policy_chain": decision["policy_chain"],
                 "governing_regulations": decision["governing_regulations"],
@@ -138,75 +160,30 @@ def chat_completions(req: ChatRequest, response: Response):
             },
         )
 
-    outgoing = req.messages
-    if decision["decision"] == "SANITIZE":
-        outgoing = [
-            ChatMessage(role=m.role, content=sanitize_text(m.content)) if m.role == "user" else m
-            for m in req.messages
-        ]
-
-    model_name = req.model or DEFAULT_MODEL
-    gen_config = {}
-    if req.temperature is not None:
-        gen_config["temperature"] = req.temperature
-    if req.max_tokens is not None:
-        gen_config["max_output_tokens"] = req.max_tokens
-
-    # ---- LLM CALL + OUTPUT guardrail with retry ----
-    attempt = 0
-    extra_system = None
-    out_eval = None
-    text = ""
-    last_resp = None
-    while True:
-        try:
-            text, last_resp = call_gemini(model_name, outgoing, gen_config, extra_system)
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"LLM call failed: {e}")
-
-        out_eval = output_guard.evaluate(user_text, text, req.required_json_fields)
-        if out_eval["passed"] or attempt >= MAX_RETRIES:
-            break
-        attempt += 1
-        extra_system = (
-            "Your previous response was flagged for: "
-            + ", ".join(out_eval["reasons"])
-            + ". Provide a safe, non-toxic, on-topic response"
-            + (f" as valid JSON containing fields {req.required_json_fields}" if req.required_json_fields else "")
-            + "."
-        )
-
-    if not out_eval["passed"]:
-        text = "I'm sorry, but I can't provide a safe response to that request."
-        output_check = "FALLBACK"
-    else:
-        output_check = "PASS" if attempt == 0 else "RETRY_RECOVERED"
-
-    um = getattr(last_resp, "usage_metadata", None)
-    prompt_tokens = getattr(um, "prompt_token_count", 0) if um else 0
-    completion_tokens = getattr(um, "candidates_token_count", 0) if um else 0
-
+    # ---- PASS / SANITIZE (delivered) ----
+    out_eval = final["out_eval"]
     response.headers["X-GuardRail-Decision"] = decision["decision"]
     response.headers["X-GuardRail-Input-Score"] = f"{input_score:.4f}"
     response.headers["X-GuardRail-Output-Score"] = f"{out_eval['output_score']:.4f}"
-    response.headers["X-GuardRail-Output-Check"] = output_check
-    response.headers["X-GuardRail-Retries"] = str(attempt)
-    response.headers["X-GuardRail-Model-Used"] = model_name
+    response.headers["X-GuardRail-Output-Check"] = final["output_check"]
+    response.headers["X-GuardRail-Retries"] = str(final["attempt"])
+    response.headers["X-GuardRail-Model-Used"] = final["model_name"]
     if decision["winning_policy"]:
         response.headers["X-GuardRail-Policy-Applied"] = decision["winning_policy"]
         response.headers["X-GuardRail-Policy-Chain"] = chain_str
 
+    usage = final.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model_name,
+        "model": final["model_name"],
         "choices": [
-            {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
+            {"index": 0, "message": {"role": "assistant", "content": final["text"]}, "finish_reason": "stop"}
         ],
         "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+            "total_tokens": usage["prompt_tokens"] + usage["completion_tokens"],
         },
     }
