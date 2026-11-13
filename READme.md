@@ -1,4 +1,4 @@
-# GuardRail-OS — LLM Safety & Compliance Gateway
+# GuardRail-OS: LLM Safety & Compliance Gateway
 
 An OpenAI-compatible proxy that sits between any application and any LLM provider and
 applies a multi-layer guardrail stack — input classification, policy resolution, PII
